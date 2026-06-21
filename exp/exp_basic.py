@@ -1,7 +1,7 @@
 import os
 import torch
 from models import Autoformer, Transformer, TimesNet, Nonstationary_Transformer, DLinear, FEDformer, \
-    Informer, LightTS, Reformer, ETSformer, Pyraformer, PatchTST, MICN, Crossformer, FiLM, iTransformer, \
+    Informer, LightTS, Reformer, ETSformer, Pyraformer, PatchTST, MICN, Crossformer, FiLM, iTransformer, MoE, \
     Koopa, TiDE, FreTS, TimeMixer, TSMixer, SegRNN
 
 
@@ -25,6 +25,7 @@ class Exp_Basic(object):
             'Crossformer': Crossformer,
             'FiLM': FiLM,
             'iTransformer': iTransformer,
+            'MoE': MoE,
             'Koopa': Koopa,
             'TiDE': TiDE,
             'FreTS': FreTS,
