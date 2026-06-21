@@ -4,6 +4,14 @@ from layers.Transformer_EncDec import Encoder, EncoderLayer
 from layers.SelfAttention_Family import FullAttention, AttentionLayer
 from layers.Embed import PatchEmbedding
 
+class Transpose(nn.Module):
+    def __init__(self, *dims, contiguous=False): 
+        super().__init__()
+        self.dims, self.contiguous = dims, contiguous
+    def forward(self, x):
+        if self.contiguous: return x.transpose(*self.dims).contiguous()
+        else: return x.transpose(*self.dims)
+
 
 class FlattenHead(nn.Module):
     def __init__(self, n_vars, nf, target_window, head_dropout=0):
@@ -18,6 +26,31 @@ class FlattenHead(nn.Module):
         x = self.linear(x)
         x = self.dropout(x)
         return x
+    
+class UncHead(nn.Module):
+    def __init__(self, n_vars, nf, target_window, d_model, head_dropout=0, arc_type="mlp"):
+        super().__init__()
+        if arc_type == "linear":
+            self.flatten_head = FlattenHead(n_vars, nf, target_window, head_dropout=head_dropout)
+        elif arc_type == "mlp":   
+            self.linear = nn.Linear(d_model, d_model)
+            self.flatten_head = FlattenHead(n_vars, nf, target_window, head_dropout=head_dropout)
+            self.relu = nn.ReLU(inplace=True)
+        self.arc_type = arc_type
+
+    def forward(self, x):  # x: [bs x nvars x d_model x patch_num]
+        x = x.permute(0, 1, 3, 2) # x: [bs x nvars x patch_num x d_model]
+        if self.arc_type == "linear":
+            x = self.flatten_head(x)
+        else:
+            x = self.linear(x)
+            x = self.relu(x)
+            x = self.flatten_head(x)
+        sq_sigma_out = x.permute(0, 2, 1) #[bs x horizon x num_var]
+        # non negative and stability
+        sq_sigma = torch.nn.functional.softplus(sq_sigma_out, threshold=5)
+        return sq_sigma
+
 
 
 class Model(nn.Module):
@@ -34,9 +67,9 @@ class Model(nn.Module):
         self.task_name = configs.task_name
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
+        self.prob_expert = configs.prob_expert
         padding = stride
-        if patch_len>configs.pred_len:
-            patch_len = configs.pred_len
+
         # patching and embedding
         self.patch_embedding = PatchEmbedding(
             configs.d_model, patch_len, stride, padding, configs.dropout)
@@ -47,14 +80,14 @@ class Model(nn.Module):
                 EncoderLayer(
                     AttentionLayer(
                         FullAttention(False, configs.factor, attention_dropout=configs.dropout,
-                                      output_attention=configs.output_attention), configs.d_model, configs.n_heads),
+                                      output_attention=False), configs.d_model, configs.n_heads),
                     configs.d_model,
                     configs.d_ff,
                     dropout=configs.dropout,
                     activation=configs.activation
                 ) for l in range(configs.e_layers)
             ],
-            norm_layer=torch.nn.LayerNorm(configs.d_model)
+            norm_layer=nn.Sequential(Transpose(1,2), nn.BatchNorm1d(configs.d_model), Transpose(1,2))
         )
 
         # Prediction Head
@@ -63,6 +96,9 @@ class Model(nn.Module):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             self.head = FlattenHead(configs.enc_in, self.head_nf, configs.pred_len,
                                     head_dropout=configs.dropout)
+            if self.prob_expert:
+                self.unc_head = UncHead(configs.enc_in, self.head_nf, configs.pred_len, configs.d_model, arc_type=configs.unc_head_type)
+                
         elif self.task_name == 'imputation' or self.task_name == 'anomaly_detection':
             self.head = FlattenHead(configs.enc_in, self.head_nf, configs.seq_len,
                                     head_dropout=configs.dropout)
@@ -71,6 +107,7 @@ class Model(nn.Module):
             self.dropout = nn.Dropout(configs.dropout)
             self.projection = nn.Linear(
                 self.head_nf * configs.enc_in, configs.num_class)
+
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         # Normalization from Non-stationary Transformer
@@ -103,6 +140,10 @@ class Model(nn.Module):
                   (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
         dec_out = dec_out + \
                   (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
+
+        if self.prob_expert:
+            sq_sigma_out = self.unc_head(enc_out)  # z: [bs x nvars x target_window]
+            return dec_out, sq_sigma_out
         return dec_out
 
     def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask):
@@ -206,7 +247,11 @@ class Model(nn.Module):
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
-            return dec_out[:, -self.pred_len:, :]  # [B, L, D]
+            if self.prob_expert:
+                dec_out, log_sq_sigma_out = dec_out
+                return dec_out[:, -self.pred_len:, :], log_sq_sigma_out[:, -self.pred_len:, :]  # [B, L, D]
+            else:
+                return dec_out[:, -self.pred_len:, :]  # [B, L, D]
         if self.task_name == 'imputation':
             dec_out = self.imputation(
                 x_enc, x_mark_enc, x_dec, x_mark_dec, mask)
