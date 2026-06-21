@@ -113,7 +113,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         total_loss = []
         self.model.eval()
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, index) in enumerate(vali_loader):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float()
 
@@ -168,7 +168,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
             self.model.train()
             epoch_time = time.time()
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, index) in enumerate(train_loader):
                 iter_count += 1
                 model_optim.zero_grad()
                 batch_x = batch_x.float().to(self.device)
@@ -254,7 +254,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self.model.eval()
        
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, index) in enumerate(test_loader):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
 
@@ -419,7 +419,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 preds_list, uncs_list, trues_list = [], [], []
                 
                 with torch.no_grad():
-                    for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(loader):
+                    for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, index) in enumerate(loader):
                         batch_x = batch_x.float().to(self.device)
                         batch_y = batch_y.float().to(self.device)
                         batch_x_mark = batch_x_mark.float().to(self.device)
@@ -527,7 +527,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             lowers, uppers, trues = [], [], []
             
             with torch.no_grad():
-                for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(loader):
+                for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, index) in enumerate(loader):
                     batch_x = batch_x.float().to(self.device)
                     batch_y = batch_y.float().to(self.device)
                     batch_x_mark = batch_x_mark.float().to(self.device)
@@ -624,7 +624,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             preds_list, trues_list = [], []
             
             with torch.no_grad():
-                for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(loader):
+                for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, index) in enumerate(loader):
                     batch_x = batch_x.float().to(self.device)
                     batch_y = batch_y.float().to(self.device)
                     batch_x_mark = batch_x_mark.float().to(self.device)

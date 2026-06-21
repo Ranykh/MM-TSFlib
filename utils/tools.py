@@ -116,3 +116,13 @@ def adjustment(gt, pred):
 
 def cal_accuracy(y_pred, y_true):
     return np.mean(y_pred == y_true)
+
+
+def visual_unc(true, preds, unc, name='./pic/test_unc.pdf'):
+    plt.figure()
+    mse = (true-preds)**2
+    plt.plot(mse, label='Squared Error', linewidth=2)
+    plt.plot(unc, label='Uncertainty (a+e))', linewidth=2)
+    plt.legend()
+    plt.savefig(name, bbox_inches='tight')
+
