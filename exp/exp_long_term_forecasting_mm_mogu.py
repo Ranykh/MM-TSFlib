@@ -33,7 +33,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         # MM-MoGU: build an explicit list of heterogeneous numeric experts.
         # self.args.numeric_experts is a list of model names, e.g.
         # ['PatchTST', 'iTransformer']. Each is constructed with the shared
-        # config and passed to the generalized MoE.
+        # config and passed to the generalized MoE. Textual (LLM) experts from
+        # self.args.textual_experts (e.g. ['BERT']) are built alongside and
+        # gated by the same inverse-variance rule.
         if self.args.moe:
             expert_models = []
             for name in self.args.numeric_experts:
@@ -41,8 +43,22 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 expert_models.append(expert_cls(self.args).float())
             print(f"MM-MoGU: built {len(expert_models)} numeric experts: "
                   f"{self.args.numeric_experts}")
-            model = self.model_dict['MoE'].Model(self.args, expert_models).float()
+
+            textual_experts = []
+            for name in getattr(self.args, 'textual_experts', []) or []:
+                from models.TextualExpert import Model as TextualExpertModel
+                textual_experts.append(TextualExpertModel(self.args, llm_name=name).float())
+            if textual_experts:
+                print(f"MM-MoGU: built {len(textual_experts)} textual experts: "
+                      f"{self.args.textual_experts}")
+            self.has_textual_experts = len(textual_experts) > 0
+
+            # keep num_experts consistent for moe_loss / uncertainty decomposition
+            self.args.num_experts = len(expert_models) + len(textual_experts)
+            model = self.model_dict['MoE'].Model(self.args, expert_models,
+                                                 textual_experts=textual_experts).float()
         else:
+            self.has_textual_experts = False
             base_model_cls = self.model_dict[self.args.model].Model
             model = base_model_cls(self.args).float()
 
@@ -125,12 +141,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                 # encoder - decoder
                 if self.args.moe:
-                    outputs, expert_unc, expert_weights = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    
+                    batch_text = vali_data.get_text(index) if self.has_textual_experts else None
+                    outputs, expert_unc, expert_weights = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, batch_text=batch_text)
+
                     # MoE validation loss computation
                     f_dim = -1 if self.args.features == 'MS' else 0
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                    loss = self.moe_loss(outputs, expert_unc, expert_weights, batch_y, criterion) 
+                    loss = self.moe_loss(outputs, expert_unc, expert_weights, batch_y, criterion)
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                     f_dim = -1 if self.args.features == 'MS' else 0
@@ -182,13 +199,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 # encoder - decoder
                 if self.args.moe:
-                    outputs, expert_unc, expert_weights = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    
+                    batch_text = train_data.get_text(index) if self.has_textual_experts else None
+                    outputs, expert_unc, expert_weights = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, batch_text=batch_text)
+
                     # MoE loss computation
                     f_dim = -1 if self.args.features == 'MS' else 0
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
-                    loss = self.moe_loss(outputs, expert_unc, expert_weights, batch_y, criterion) 
+                    loss = self.moe_loss(outputs, expert_unc, expert_weights, batch_y, criterion)
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                     f_dim = -1 if self.args.features == 'MS' else 0
@@ -267,7 +285,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 
                 # encoder - decoder
                 if self.args.moe:
-                    outputs, expert_unc, expert_weights = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    batch_text = test_data.get_text(index) if self.has_textual_experts else None
+                    outputs, expert_unc, expert_weights = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, batch_text=batch_text)
                     if self.args.save_expert_outputs:
                         weights.append(expert_weights.detach().cpu().numpy())
                         per_expert_outputs.append(outputs.detach().cpu().numpy())
@@ -429,7 +448,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                         
                         if self.args.moe and self.args.prob_expert:
-                            outputs, expert_unc, expert_weights = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                            batch_text = data_set.get_text(index) if self.has_textual_experts else None
+                            outputs, expert_unc, expert_weights = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, batch_text=batch_text)
                             agg_outputs = torch.sum(outputs * expert_weights, dim=1)
                             _, _, total_variance = self.calc_aleatoric_epistermic_uncertainty(
                                 outputs, agg_outputs, expert_unc, expert_weights
@@ -634,8 +654,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                     
                     if self.args.moe:
-                        outputs, _, expert_weights = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        pred = torch.sum(outputs * expert_weights, dim=1) 
+                        batch_text = data_set.get_text(index) if self.has_textual_experts else None
+                        outputs, _, expert_weights = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, batch_text=batch_text)
+                        pred = torch.sum(outputs * expert_weights, dim=1)
                     else:
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                         pred = outputs
