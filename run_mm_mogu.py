@@ -139,7 +139,8 @@ if __name__ == '__main__':
     parser.add_argument('--numeric_experts', type=str, nargs='+', default=['PatchTST', 'iTransformer'],
                         help='list of numeric expert model names')
     parser.add_argument('--textual_experts', type=str, nargs='+', default=[],
-                        help='list of textual expert model names, e.g. BERT (empty for Phase 1)')
+                        help='list of textual expert model names: BERT, GPT2, GPT2M, GPT2L, GPT2XL, '
+                             'LLAMA3 (LLAMA3 needs --huggingface_token); empty for Phase 1')
     parser.add_argument('--inv_var_norm', type=str, default='none',
                         help="variance handling for the inverse-variance gate: 'none' (raw 1/sigma^2) "
                              "or 'per_modality' (z-score log-variance within each modality; use when "
