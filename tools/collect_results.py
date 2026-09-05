@@ -81,7 +81,8 @@ def git_info(repo_root):
         sha = _run(["git", "rev-parse", "HEAD"])
         if sha.returncode != 0:
             return "NO-GIT", ""
-        st = _run(["git", "status", "--porcelain"])
+        # Untracked run output must not invalidate the SHA.
+        st = _run(["git", "status", "--porcelain", "--untracked-files=no"])
         return sha.stdout.strip(), ("yes" if st.stdout.strip() else "no")
     except (OSError, subprocess.SubprocessError):
         return "NO-GIT", ""
@@ -268,10 +269,20 @@ def audit(rows, skipped, expect, results_root):
 
 
 def write_pivot(rows, out):
+    """Average over seeds. A dict comprehension keyed without the seed keeps only
+    whichever row happened to sort last, silently discarding the other seeds and
+    reporting a single run as if it were the cell's result."""
     def key(r):
         return (r["domain"], r["model"], str(r["llm"]), r["pred_len"])
-    uni = {key(r): r["mse"] for r in rows if r["tag"] == "uni"}
-    multi = {key(r): r["mse"] for r in rows if r["tag"] == "multi"}
+
+    def mean_by_tag(tag):
+        acc = {}
+        for r in rows:
+            if r["tag"] == tag:
+                acc.setdefault(key(r), []).append(r["mse"])
+        return {k: sum(v) / len(v) for k, v in acc.items()}
+
+    uni, multi = mean_by_tag("uni"), mean_by_tag("multi")
     both = sorted(set(uni) & set(multi))
     pivot = out.replace(".csv", "_pivot.csv")
     with open(pivot, "w", newline="") as fh:

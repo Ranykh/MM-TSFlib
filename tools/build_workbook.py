@@ -1069,6 +1069,89 @@ def build_calibration(wb):
     print(f"  Calibration: {len(CALIB_ROWS)} cells")
 
 
+
+def build_summary(wb, runs, published):
+    """A STATIC snapshot of the headline table.
+
+    Everything on Pairwise_Baselines is a live formula, which is correct but
+    invisible until a spreadsheet application recalculates the file: openpyxl
+    writes no cached values, so Quick Look, Finder preview and some viewers show
+    an empty grid. This sheet holds literal numbers so the result is legible
+    anywhere. It does NOT update when Raw_Runs changes -- rebuild to refresh.
+    """
+    import collections
+    import statistics as _st
+    if "Results_Summary" in wb.sheetnames:
+        del wb["Results_Summary"]
+    ws = wb.create_sheet("Results_Summary", 1)
+
+    cells = collections.defaultdict(dict)
+    for r in runs:
+        if not r.get("mse"):
+            continue
+        k = (r["domain_sheet"], r["model"], r["tsf_t"], r["pred_len"])
+        cells[k].setdefault(r["method"], []).append(float(r["mse"]))
+
+    notes = [
+        "STATIC SNAPSHOT — literal numbers, so this sheet reads correctly in any viewer.",
+        "Pairwise_Baselines carries the same figures as live formulas over Raw_Runs. "
+        "This sheet does not update on its own; rebuild the workbook to refresh it.",
+        "MSE, lower is better. Mean over 3 seeds (2021-2023), with the seed standard "
+        "deviation. Published columns are locked references, not targets we control.",
+        "NEVER average across domains: Economy is ~0.02, Social Good ~1.0.",
+    ]
+    for i, t in enumerate(notes, start=1):
+        c = ws.cell(row=i, column=1, value=t)
+        c.font = Font(name="Arial", size=9, bold=(i == 1),
+                      italic=(i > 1), color="FF8A2A2A" if i in (1, 4) else "FF333333")
+
+    hdr = ["Domain", "TSF-N", "TSF-T", "Horizon",
+           "PUBLISHED G1", "PUBLISHED G3",
+           "ours G1", "ours G3", "ours G4 raw", "ours G4c calib", "ours G4n per-mod",
+           "G4 − G3", "G4c − G3", "seeds"]
+    for j, h in enumerate(hdr, start=1):
+        c = ws.cell(row=6, column=j, value=h)
+        c.font, c.alignment = REPRO_HDR_FONT, Alignment(horizontal="center", wrap_text=True)
+        c.fill = CLAIM_HDR_FILL if j in (12, 13) else REPRO_HDR_FILL
+
+    order = {"Economy": 0, "Traffic": 1, "Social Good": 2}
+    row = 7
+    for k in sorted(cells, key=lambda k: (order.get(k[0], 9), k[1], k[2], k[3])):
+        dom, n, t, h = k
+        v = cells[k]
+
+        def m(key):
+            return _st.mean(v[key]) if key in v else None
+
+        def sd(key):
+            return _st.stdev(v[key]) if key in v and len(v[key]) > 1 else None
+
+        g3, g4, g4c = m("G3_ATTN_direct"), m("G4_IV"), m("G4c_IV_calib")
+        g4n, g1 = m("G4n_IV_permod"), m("G1_FIXED_multi")
+        pub = published.get((dom, n, t, h), (None, None))
+        vals = [dom, n, t, h, pub[0], pub[1], g1, g3, g4, g4c, g4n,
+                (g4 - g3) if (g4 is not None and g3 is not None) else None,
+                (g4c - g3) if (g4c is not None and g3 is not None) else None,
+                max((len(v[x]) for x in v), default=0)]
+        for j, val in enumerate(vals, start=1):
+            c = ws.cell(row=row, column=j, value=val)
+            c.font = Font(name="Arial", size=10)
+            if j in (5, 6):
+                c.number_format, c.fill = MSE_FMT, PatternFill("solid", fgColor="FFEDEFF3")
+            elif j in (7, 8, 9, 10, 11):
+                c.number_format, c.fill = MSE_FMT, REPRO_VAL_FILL
+            elif j in (12, 13):
+                c.number_format, c.fill = DELTA_FMT, CLAIM_VAL_FILL
+                c.font = Font(name="Arial", size=10, bold=True)
+        row += 1
+
+    for col, w in zip("ABCDEFGHIJKLMN",
+                      (13, 13, 9, 8, 12, 12, 10, 10, 11, 13, 14, 11, 11, 7)):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "E7"
+    print(f"  Results_Summary: {row - 7} rows (static)")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1100,6 +1183,20 @@ def main():
     runs = write_raw_runs(wb, raw)
     audit_layout(wb)
     print("  layout check: column letters match headers")
+
+    # Published G1/G3, read from the locked columns before anything is written.
+    published = {}
+    if "Pairwise_Baselines" in wb.sheetnames:
+        pw = wb["Pairwise_Baselines"]
+        for rr in range(6, pw.max_row + 1):
+            dom, hz = pw[f"A{rr}"].value, pw[f"C{rr}"].value
+            n, t = pw[f"D{rr}"].value, pw[f"E{rr}"].value
+            if dom and n and t and isinstance(hz, (int, float)):
+                published[(str(dom).strip(), str(n).strip(), str(t).strip(), int(hz))] = (
+                    pw[f"F{rr}"].value, pw[f"G{rr}"].value)
+
+    print("\nwriting Results_Summary (static)")
+    build_summary(wb, runs, published)
 
     audit = []
     print("\nwriting Legend")
