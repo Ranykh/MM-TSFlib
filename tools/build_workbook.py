@@ -58,6 +58,7 @@ There is no LibreOffice on the Mac, so formula cells carry no cached values
 until Excel or Sheets opens the file. The --audit output stands in for that.
 """
 import argparse
+import collections
 import csv
 import os
 import sys
@@ -65,6 +66,7 @@ import sys
 try:
     import openpyxl
     from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import column_index_from_string as cidx
     from openpyxl.utils import get_column_letter as CL
 except ImportError:
     sys.exit("needs openpyxl: pip install openpyxl")
@@ -507,290 +509,463 @@ def build_legend(wb):
 
 # ==========================================================================
 # Pairwise_Baselines -- THE DELIVERABLE
+#
+# Rebuilt rather than patched. The v2 template reserved columns for four gates
+# (G4/G5/G6/G7) in a "mixed pool" that were never run, and offered no row at all
+# for expert pairs outside the published set -- which silently hid 40% of our
+# runs, because the published tables carry no BERT rows for the monthly domains
+# and no iTransformer anywhere.
+#
+# Layout: A-G are the published identity and reference values, copied verbatim.
+# H-T are ours. Rows for pairs with no published counterpart are appended below
+# the published block and clearly marked.
 # ==========================================================================
+PW_COLS = [
+    ("Domain", 13), ("Freq", 9), ("Horizon", 8), ("TSF-N", 12), ("TSF-T", 10),
+    ("G1 FIXED\n(TimeMMD)\nPUBLISHED", 12), ("G3 ATTN\n(GMM-TS)\nPUBLISHED", 12),
+    ("G1 FIXED\nOURS", 11), ("G3 ATTN\nOURS", 11), ("G4 IV\nOURS", 11),
+    ("G4c IV-calib\nOURS", 13), ("G4n IV-per-mod\nOURS", 14),
+    ("Δ G1\nours − pub", 11), ("Δ G3\nours − pub", 11),
+    ("G4 − our G3\nTHE CLAIM", 13), ("G4c − our G3\nCALIBRATED", 13),
+    ("best of ours", 12), ("which gate won", 14),
+    ("harness check\nG3 vs published", 15), ("n runs", 8), ("Src", 10),
+]
+PW_METHOD = {"H": "G1_FIXED_multi", "I": "G3_ATTN_direct", "J": "G4_IV",
+             "K": "G4c_IV_calib", "L": "G4n_IV_permod"}
+
+
 def build_pairwise(wb, runs, audit):
-    """Published: A Domain, B Freq, C Horizon, D TSF-N, E TSF-T,
-                  F G1 FIXED (TimeMMD), G G3 ATTN (GMM-TS), H..K our Phase-2 gates."""
     if "Pairwise_Baselines" not in wb.sheetnames:
-        print("  ! Pairwise_Baselines sheet not found, skipped")
+        print("  ! Pairwise_Baselines not found, skipped")
         return
-    ws = wb["Pairwise_Baselines"]
+    src = wb["Pairwise_Baselines"]
 
-    T = 20   # first reproduced column
-    cols = {
-        "g1": T, "g3": T + 1, "g4": T + 2, "g4c": T + 3, "g4n": T + 4,
-        "d_g1": T + 6, "d_g3": T + 7,
-        "claim": T + 9, "claim_c": T + 10, "claim_n": T + 11,
-        "vs_g1": T + 12, "wins": T + 13,
-        "harness": T + 15, "n": T + 16,
-    }
+    published, notes = [], []
+    for r in range(6, src.max_row + 1):
+        dom, freq, hz = src[f"A{r}"].value, src[f"B{r}"].value, src[f"C{r}"].value
+        n, t = src[f"D{r}"].value, src[f"E{r}"].value
+        if dom and n and t and isinstance(hz, (int, float)):
+            published.append((str(dom).strip(), freq, int(hz), str(n).strip(),
+                              str(t).strip(), src[f"F{r}"].value, src[f"G{r}"].value,
+                              src[f"R{r}"].value))
+        elif dom and not isinstance(hz, (int, float)) and isinstance(dom, str) \
+                and len(dom) > 60:
+            notes.append(dom)
 
-    _banner(ws, 4, T,
-            "REPRODUCED BY US — live formulas over Raw_Runs. The published G1/G3 "
-            "columns to the left are untouched.")
-    _hdr(ws, 5, cols["g1"], "R: G1 FIXED\n(TimeMMD, ours)", width=14)
-    _hdr(ws, 5, cols["g3"], "R: G3 ATTN\n(GMM-TS, ours)", width=14)
-    _hdr(ws, 5, cols["g4"], "R: G4 IV\n(MM-MoGU, ours)", width=14)
-    _hdr(ws, 5, cols["g4c"], "R: G4c IV-calibrated\n(ours)", width=16)
-    _hdr(ws, 5, cols["g4n"], "R: G4n IV-per-mod\n(ours)", width=15)
-    _hdr(ws, 5, cols["d_g1"], "Δ G1\nours − pub", width=11)
-    _hdr(ws, 5, cols["d_g3"], "Δ G3\nours − pub", width=11)
-    _hdr(ws, 5, cols["claim"], "G4 − our G3\n(THE CLAIM)", width=14, claim=True)
-    _hdr(ws, 5, cols["claim_c"], "G4c − our G3\n(CALIBRATED)", width=14, claim=True)
-    _hdr(ws, 5, cols["claim_n"], "G4n − our G3", width=13, claim=True)
-    _hdr(ws, 5, cols["vs_g1"], "G4 − pub G1", width=12, claim=True)
-    _hdr(ws, 5, cols["wins"], "G4 beats\nour G3?", width=11, claim=True)
-    _hdr(ws, 5, cols["harness"], "harness check\n(G3 vs pub)", width=13)
-    _hdr(ws, 5, cols["n"], "n runs", width=8)
+    have = set()
+    for r in runs:
+        if r.get("domain_sheet") and r.get("model") and r.get("tsf_t"):
+            have.add((r["domain_sheet"], r["model"], r["tsf_t"], r["pred_len"]))
+    pub_keys = {(p[0], p[3], p[4], p[2]) for p in published}
+    orphans = sorted(have - pub_keys)
 
-    written = 0
-    for r in range(6, ws.max_row + 1):
-        domain, horizon = ws[f"A{r}"].value, ws[f"C{r}"].value
-        tsf_n, tsf_t = ws[f"D{r}"].value, ws[f"E{r}"].value
-        # Data rows only: the sheet also holds roll-ups and prose notes.
-        if not isinstance(horizon, (int, float)) or not domain or not tsf_n or not tsf_t:
-            continue
-        domain, tsf_n, tsf_t = str(domain).strip(), str(tsf_n).strip(), str(tsf_t).strip()
-        pl = int(horizon)
+    idx = wb.sheetnames.index("Pairwise_Baselines")
+    del wb["Pairwise_Baselines"]
+    ws = wb.create_sheet("Pairwise_Baselines", idx)
 
-        base = [("domain_sheet", domain), ("model", tsf_n),
-                ("tsf_t", tsf_t), ("pred_len", pl)]
-        specs = [
-            ("g1", base + [("method", "G1_FIXED_multi")], "F"),
-            ("g3", base + [("method", "G3_ATTN_direct")], "G"),
-            ("g4", base + [("method", "G4_IV")], None),
-            ("g4c", base + [("method", "G4c_IV_calib")], None),
-            ("g4n", base + [("method", "G4n_IV_permod")], None),
-        ]
-        for key, filters, pub in specs:
-            _put(ws, r, cols[key], f_mean("mse", filters),
-                 claim=(key in ("g4", "g4c", "g4n")))
+    ws["A1"] = "Pairwise results — published references beside our reproductions"
+    ws["A1"].font = Font(name="Arial", size=12, bold=True, color="FF215E6B")
+    for i, txt in enumerate([
+        "Columns F-G are PUBLISHED (GMM-TS supplementary, Tables 3-11) and locked. "
+        "Columns H-T are OURS, as live formulas over Raw_Runs. Lower MSE is better.",
+        "Columns for gates that were never run (G5 SNIV, G6 UCA, G7 TUG) have been "
+        "REMOVED rather than left blank. G4n is the per-modality variant we did run; "
+        "it is not G5.",
+        "Rows below the published block are expert pairs we ran that have NO published "
+        "counterpart — the published tables carry no BERT rows for monthly domains and "
+        "no iTransformer at all. Without them 40% of our runs would be invisible here.",
+        "NEVER average MSE across domains: Economy ≈ 0.02, Social Good ≈ 1.0, "
+        "Security ≈ 112.",
+    ], start=2):
+        c = ws.cell(row=i, column=1, value=txt)
+        c.font = Font(name="Arial", size=9, italic=True,
+                      color="FF8A2A2A" if i in (4, 5) else "FF555555")
+
+    HDR = 6
+    for j, (label, width) in enumerate(PW_COLS, start=1):
+        c = ws.cell(row=HDR, column=j, value=label)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.font = REPRO_HDR_FONT
+        c.fill = (PatternFill("solid", fgColor="FF215E6B") if j <= 7
+                  else CLAIM_HDR_FILL if j in (15, 16) else REPRO_HDR_FILL)
+        ws.column_dimensions[CL(j)].width = width
+    ws.row_dimensions[HDR].height = 34
+
+    def emit(row, dom, freq, hz, n, t, g1p, g3p, src_lbl, published_row):
+        for j, v in enumerate([dom, freq, hz, n, t, g1p, g3p], start=1):
+            c = ws.cell(row=row, column=j, value=v)
+            c.font = Font(name="Arial", size=10)
+            if j in (6, 7):
+                c.number_format = MSE_FMT
+                c.fill = PatternFill("solid", fgColor="FFEDEFF3")
+        ws.cell(row=row, column=21, value=src_lbl if published_row else "no published row"
+                ).font = Font(name="Arial", size=9, italic=True,
+                              color="FF555555" if published_row else "FF8A2A2A")
+
+        base = [("domain_sheet", dom), ("model", n), ("tsf_t", t), ("pred_len", hz)]
+        for col, method in PW_METHOD.items():
+            j = cidx(col)
+            filt = base + [("method", method)]
+            _put(ws, row, j, f_mean("mse", filt), claim=(col in ("J", "K")))
             if audit is not None:
-                audit.append((f"Pairwise!{CL(cols[key])}{r}",
-                              f"{domain} h={pl} {tsf_n}x{tsf_t} {key.upper()}",
-                              resolve(runs, "mse", filters),
-                              ws[f"{pub}{r}"].value if pub else None))
+                audit.append((f"Pairwise!{col}{row}",
+                              f"{dom} h={hz} {n}x{t} {method.split('_')[0]}",
+                              resolve(runs, "mse", filt),
+                              g1p if col == "H" else (g3p if col == "I" else None)))
 
-        g1c, g3c, g4c = (f"{CL(cols['g1'])}{r}", f"{CL(cols['g3'])}{r}",
-                         f"{CL(cols['g4'])}{r}")
-        g4nc = f"{CL(cols['g4n'])}{r}"
-        g4cc = f"{CL(cols['g4c'])}{r}"
-        _put(ws, r, cols["d_g1"], f_delta(g1c, f"F{r}"), fmt=DELTA_FMT, fill=False)
-        _put(ws, r, cols["d_g3"], f_delta(g3c, f"G{r}"), fmt=DELTA_FMT, fill=False)
-
-        # The apples-to-apples claim: our gate against our own reproduction of
-        # the learned gate, in one codebase under one training recipe. Negative
-        # is better (lower MSE).
-        _put(ws, r, cols["claim"], f_delta(g4c, g3c), fmt=DELTA_FMT, claim=True)
-        _put(ws, r, cols["claim_c"], f_delta(g4cc, g3c), fmt=DELTA_FMT, claim=True)
-        _put(ws, r, cols["claim_n"], f_delta(g4nc, g3c), fmt=DELTA_FMT, claim=True)
-        _put(ws, r, cols["vs_g1"], f_delta(g4c, f"F{r}"), fmt=DELTA_FMT, claim=True)
-        ws.cell(row=r, column=cols["wins"], value=(
-            f'=IF(OR({g4c}="",{g3c}=""),"",IF({g4c}<{g3c},"yes","no"))')
+        H, I_, J, K, L = (f"H{row}", f"I{row}", f"J{row}", f"K{row}", f"L{row}")
+        _put(ws, row, 13, f_delta(H, f"F{row}"), fmt=DELTA_FMT, fill=False)
+        _put(ws, row, 14, f_delta(I_, f"G{row}"), fmt=DELTA_FMT, fill=False)
+        _put(ws, row, 15, f_delta(J, I_), fmt=DELTA_FMT, claim=True)
+        _put(ws, row, 16, f_delta(K, I_), fmt=DELTA_FMT, claim=True)
+        ws.cell(row=row, column=17, value=(
+            f'=IF(COUNT({H},{I_},{J},{K},{L})=0,"",MIN({H},{I_},{J},{K},{L}))')
+        ).number_format = MSE_FMT
+        ws.cell(row=row, column=18, value=(
+            f'=IF(Q{row}="","",IFS({H}=Q{row},"G1 ours",{I_}=Q{row},"G3 ours",'
+            f'{J}=Q{row},"G4",{K}=Q{row},"G4c",{L}=Q{row},"G4n"))')
         ).font = STATUS_FONT
-
-        # Harness check: if our G3 does not reproduce the published G3, the
-        # G4-vs-G3 comparison is still internally valid but the absolute numbers
-        # are not comparable to the paper. Say which.
-        ws.cell(row=r, column=cols["harness"], value=(
-            f'=IF({g3c}="","not run",IF(G{r}="","no target",'
-            f'IF(OR(ABS(({g3c}-G{r})/G{r})<={TOL_MATCH},ABS({g3c}-G{r})<={TOL_ABS}),"match",'
-            f'IF(ABS(({g3c}-G{r})/G{r})<={TOL_CLOSE},"close","FAIL"))))')
+        ws.cell(row=row, column=19, value=(
+            f'=IF({I_}="","not run",IF(G{row}="","no published G3",'
+            f'IF(OR(ABS(({I_}-G{row})/G{row})<={TOL_MATCH},ABS({I_}-G{row})<={TOL_ABS}),'
+            f'"match",IF(ABS(({I_}-G{row})/G{row})<={TOL_CLOSE},"close","FAIL"))))')
         ).font = STATUS_FONT
-        counts = [f"COUNTIFS({_crit(base + [('method', m)])})"
-                  for m in ("G1_FIXED_multi", "G3_ATTN_direct", "G4_IV",
-                            "G4c_IV_calib", "G4n_IV_permod")]
-        ws.cell(row=r, column=cols["n"], value="=" + "+".join(counts))
-        written += 1
+        ws.cell(row=row, column=20, value="=" + "+".join(
+            f"COUNTIFS({_crit(base + [('method', m)])})" for m in PW_METHOD.values()))
 
-    _banner(ws, 3, T,
-            "Never average MSE across domains — scales differ by three orders of "
-            "magnitude (Agriculture ~0.06 vs Security ~100-130). Compare within "
-            "domain, per horizon, per expert pair.", color="FF8A2A2A")
-    print(f"  Pairwise_Baselines: {written} data rows wired up")
+    row = HDR + 1
+    for dom, freq, hz, n, t, g1p, g3p, src_lbl in published:
+        emit(row, dom, freq, hz, n, t, g1p, g3p, src_lbl, True)
+        row += 1
+
+    if orphans:
+        row += 1
+        c = ws.cell(row=row, column=1,
+                    value=("OUR RUNS WITH NO PUBLISHED COUNTERPART — "
+                           f"{len(orphans)} cells. The published tables have no BERT rows "
+                           "for the monthly domains and no iTransformer at all, so these "
+                           "pairs cannot be scored against a reference. The G4 − G3 and "
+                           "G4c − G3 comparisons remain fully valid: they are ours "
+                           "against ours."))
+        c.font = Font(name="Arial", size=9, bold=True, italic=True, color="FF8A2A2A")
+        row += 1
+        freq_of = {p[0]: p[1] for p in published}
+        for dom, n, t, hz in orphans:
+            emit(row, dom, freq_of.get(dom), hz, n, t, None, None, None, False)
+            row += 1
+
+    if notes:
+        row += 1
+        for nt in notes:
+            ws.cell(row=row, column=1, value=nt).font = Font(
+                name="Arial", size=9, italic=True, color="FF555555")
+            row += 1
+
+    ws.freeze_panes = "F7"
+    print(f"  Pairwise_Baselines: {len(published)} published rows + "
+          f"{len(orphans)} unmatched = {len(published) + len(orphans)} data rows")
+    return HDR + 1, HDR + len(published)
 
 
-# ==========================================================================
-# MoGU_ETT
-# ==========================================================================
+def trim_empty_columns(wb):
+    """Delete reserved columns for experiments that were never run.
+
+    Leaving them blank invites the reader to assume the numbers are missing
+    rather than that the run does not exist.
+    """
+    plan = {
+        # sheet: (header row, columns to drop, why)
+        "Pool_Ablation": (5, ["E", "F", "G", "H", "I", "J", "K", "L", "N", "O", "P"],
+                          "text-only and numeric-only pools were never run; "
+                          "G5/G6/G7 were never run"),
+        "Domain_Summary": (4, ["H", "I"],
+                           "text-only and numeric-only pools were never run"),
+    }
+    for sheet, (hdr, cols, why) in plan.items():
+        if sheet not in wb.sheetnames:
+            continue
+        ws = wb[sheet]
+        for col in sorted(cols, key=cidx, reverse=True):
+            ws.delete_cols(cidx(col))
+        last = ws.max_row + 2
+        c = ws.cell(row=last, column=1,
+                    value=f"Columns removed: {why}. Only configurations that were "
+                          f"actually run appear in this workbook.")
+        c.font = Font(name="Arial", size=9, italic=True, color="FF8A2A2A")
+        print(f"  {sheet}: removed {len(cols)} never-run column(s)")
+
+
 def build_mogu_ett(wb, runs, audit):
+    """MoGU_ETT is a PUBLISHED REFERENCE only.
+
+    moe_unc_tsf has not been run, so every 'yours' column here would be empty.
+    They are removed and the sheet is labelled, rather than left as blank
+    promises.
+    """
     if "MoGU_ETT" not in wb.sheetnames:
-        print("  ! MoGU_ETT sheet not found, skipped")
         return
     ws = wb["MoGU_ETT"]
-    ws["A2"] = ("Source: arXiv:2510.07459v2, Tables 1, 2, 4. Lookback 96. "
-                "VERIFIED against the paper PDF (Tables 1, 2, 4 match cell for cell) "
-                "— confidence upgraded from Medium to High.")
+    for col in ("N", "M", "L", "K"):          # the never-run G4/G5/G6/G7 columns
+        ws.delete_cols(cidx(col))
+    ws["A2"] = ("Source: arXiv:2510.07459v2, Tables 1, 2, 4. Lookback 96. VERIFIED against "
+                "the paper PDF — Tables 1, 2 and 4 match cell for cell, so confidence is "
+                "High, not Medium.")
     ws["A2"].font = Font(name="Arial", size=9, italic=True, color="FF1E5B3A")
-    _t1(ws, runs, audit)
-    _t2(ws, runs, audit)
-    _t4(ws, runs, audit)
-
-
-def _t1(ws, runs, audit):
-    rows = {"ETTh1": 7, "ETTh2": 8, "ETTm1": 9, "ETTm2": 10}
-    specs = [("Single", "B", "single", 1),
-             ("MoE-2", "C", "MoE", 2), ("MoE-3", "D", "MoE", 3),
-             ("MoE-4", "E", "MoE", 4), ("MoE-5", "F", "MoE", 5),
-             ("MoGU-2", "G", "MoGU", 2), ("MoGU-3", "H", "MoGU", 3),
-             ("MoGU-4", "I", "MoGU", 4), ("MoGU-5", "J", "MoGU", 5)]
-    R0 = 16
-    D0 = R0 + len(specs) + 1
-    EX = D0 + len(specs) + 1
-
-    _banner(ws, 5, R0, "REPRODUCED — live over Raw_Runs. Δ = reproduced − published. "
-                       "Tolerance |Δ|/published: ≤2% match, ≤5% close, else FAIL.")
-    for i, (label, _p, _c, _n) in enumerate(specs):
-        _hdr(ws, 6, R0 + i, f"R: {label}", width=10)
-        _hdr(ws, 6, D0 + i, f"Δ {label}", width=9)
-    for j, (label, w) in enumerate([("|%Δ| MoGU-3", 11), ("STATUS", 11), ("n runs", 8),
-                                    ("min gate std", 12), ("MoE worse than single?", 20)]):
-        _hdr(ws, 6, EX + j, label, width=w)
-
-    for dset, r in rows.items():
-        counts = []
-        for i, (label, pub, cfg, ne) in enumerate(specs):
-            filters = [("dataset", dset), ("model", "iTransformer"),
-                       ("pred_len", 96), ("method", cfg), ("num_experts", ne)]
-            rc, dc = CL(R0 + i), CL(D0 + i)
-            _put(ws, r, R0 + i, f_mean("mse", filters))
-            _put(ws, r, D0 + i, f_delta(f"{rc}{r}", f"{pub}{r}"), fmt=DELTA_FMT, fill=False)
-            counts.append(f"COUNTIFS({_crit(filters)})")
-            if audit is not None:
-                audit.append((f"MoGU_ETT!{rc}{r}", f"T1 {dset} {label}",
-                              resolve(runs, "mse", filters), ws[f"{pub}{r}"].value))
-
-        # Anchored on MoGU-3: Excel's MAX raises #VALUE! on a cell holding "",
-        # so a max across all nine would blank the verdict during a partial sweep.
-        m3r, m3d = f"{CL(R0 + 6)}{r}", f"{CL(D0 + 6)}{r}"
-        ws.cell(row=r, column=EX,
-                value=f'=IF(OR({m3r}="",H{r}=""),"",ABS({m3d}/H{r}))').number_format = PCT_FMT
-        g = CL(EX)
-        ws.cell(row=r, column=EX + 1, value=(
-            f'=IF({m3r}="","not run",IF({g}{r}<={TOL_MATCH},"match",'
-            f'IF({g}{r}<={TOL_CLOSE},"close","FAIL")))')).font = STATUS_FONT
-        ws.cell(row=r, column=EX + 2, value=f'={"+".join(counts)}')
-        mogu = [("dataset", dset), ("model", "iTransformer"),
-                ("pred_len", 96), ("method", "MoGU")]
-        ws.cell(row=r, column=EX + 3,
-                value=f'=IFERROR(MINIFS({_rng("gate_w_std")},{_crit(mogu)}),"")'
-                ).number_format = MSE_FMT
-        exp = "TRUE" if dset in ("ETTh2", "ETTm1") else "either"
-        moe3, single = f"{CL(R0 + 2)}{r}", f"{CL(R0)}{r}"
-        ws.cell(row=r, column=EX + 4, value=(
-            f'=IF(OR({moe3}="",{single}=""),"not run",'
-            f'IF({moe3}>{single},"MoE worse (expected: {exp})",'
-            f'"MoE better (expected: {exp})"))'))
-
-    _banner(ws, 11, R0, "Sanity beats point values: MoE MUST be worse than a single "
-                        "expert on ETTh2 and ETTm1. THE GATE: ETTh1 MoGU-3 ≈ 0.380.")
-
-
-def _t2(ws, runs, audit):
-    specs = [("iT MoE MAE", "C", "iTransformer", "MoE", "mae"),
-             ("iT MoE MSE", "D", "iTransformer", "MoE", "mse"),
-             ("iT MoGU MAE", "E", "iTransformer", "MoGU", "mae"),
-             ("iT MoGU MSE", "F", "iTransformer", "MoGU", "mse"),
-             ("PT MoE MAE", "G", "PatchTST", "MoE", "mae"),
-             ("PT MoE MSE", "H", "PatchTST", "MoE", "mse"),
-             ("PT MoGU MAE", "I", "PatchTST", "MoGU", "mae"),
-             ("PT MoGU MSE", "J", "PatchTST", "MoGU", "mse")]
-    R0 = 16
-    D0 = R0 + len(specs) + 1
-    EX = D0 + len(specs) + 1
-
-    _banner(ws, 13, R0, f"REPRODUCED (num_experts={DEFAULT_NE}). The paper does not "
-                        "state Table 2's expert count; 3 is what its Table 1 "
-                        "highlights and the repo defaults to.")
-    for i, (label, *_rest) in enumerate(specs):
-        _hdr(ws, 14, R0 + i, f"R: {label}", width=11)
-        _hdr(ws, 14, D0 + i, f"Δ {label}", width=10)
-    _hdr(ws, 14, EX, "|%Δ| iT MoGU MSE", width=15)
-    _hdr(ws, 14, EX + 1, "STATUS", width=11)
-    _hdr(ws, 14, EX + 2, "n runs", width=8)
-
-    for r in range(15, 43):
-        label, horizon = ws[f"A{r}"].value, ws[f"B{r}"].value
-        if not label or horizon is None:
-            continue
-        dset = DATASET_ALIAS.get(str(label).strip())
-        if dset is None:
-            continue
-        pl, counts = int(horizon), []
-        for i, (name, pub, model, cfg, metric) in enumerate(specs):
-            filters = [("dataset", dset), ("model", model), ("pred_len", pl),
-                       ("method", cfg), ("num_experts", DEFAULT_NE)]
-            rc, dc = CL(R0 + i), CL(D0 + i)
-            _put(ws, r, R0 + i, f_mean(metric, filters))
-            _put(ws, r, D0 + i, f_delta(f"{rc}{r}", f"{pub}{r}"), fmt=DELTA_FMT, fill=False)
-            counts.append(f"COUNTIFS({_crit(filters)})")
-            if audit is not None:
-                audit.append((f"MoGU_ETT!{rc}{r}", f"T2 {label} h={pl} {name}",
-                              resolve(runs, metric, filters), ws[f"{pub}{r}"].value))
-        ar, ad = f"{CL(R0 + 3)}{r}", f"{CL(D0 + 3)}{r}"
-        ws.cell(row=r, column=EX,
-                value=f'=IF(OR({ar}="",F{r}=""),"",ABS({ad}/F{r}))').number_format = PCT_FMT
-        g = CL(EX)
-        ws.cell(row=r, column=EX + 1, value=(
-            f'=IF({ar}="","not run",IF({g}{r}<={TOL_MATCH},"match",'
-            f'IF({g}{r}<={TOL_CLOSE},"close","FAIL")))')).font = STATUS_FONT
-        ws.cell(row=r, column=EX + 2, value=f'=({"+".join(counts)})/2')
-
-    _banner(ws, 43, R0, "MoGU wins 18 of 32 MSE settings on iTransformer and 19 of 32 "
-                        "on PatchTST — not all. (The often-quoted 21/32 is the MAE "
-                        "count; Num. Wins reads 4 9 21 18 | 5 8 21 19.) A correct "
-                        "reproduction reproduces the losses too.")
-
-
-def _t4(ws, runs, audit):
-    rows = {"ETTh1": 47, "ETTh2": 48, "ETTm1": 49, "ETTm2": 50}
-    R0 = 16
-    _banner(ws, 45, R0, "REPRODUCED — std is the live identity "
-                        "sqrt((SUM(x²)−n·mean²)/(n−1)); Excel has no STDEVIFS. "
-                        "Seeds 2351-2355.")
-    for i, label in enumerate(["R: MoE MSE", "R: MoE MSE std",
-                               "R: MoGU MSE", "R: MoGU MSE std"]):
-        _hdr(ws, 46, R0 + i, label, width=13)
-    for j, (label, w) in enumerate([("n seeds MoE", 11), ("n seeds MoGU", 12)]):
-        _hdr(ws, 46, R0 + 4 + j, label, width=w)
-    for j, (label, w) in enumerate([("Δ MoGU MSE", 11), ("Δ MoGU std", 11),
-                                    ("std ratio MoE/MoGU", 17), ("STATUS", 11)]):
-        _hdr(ws, 46, R0 + 7 + j, label, width=w)
-
-    for dset, r in rows.items():
-        moe = [("dataset", dset), ("model", "iTransformer"), ("pred_len", 96),
-               ("method", "MoE"), ("num_experts", DEFAULT_NE)]
-        mogu = [("dataset", dset), ("model", "iTransformer"), ("pred_len", 96),
-                ("method", "MoGU"), ("num_experts", DEFAULT_NE)]
-        _put(ws, r, R0 + 0, f_mean("mse", moe))
-        _put(ws, r, R0 + 1, f_std("mse", moe))
-        _put(ws, r, R0 + 2, f_mean("mse", mogu))
-        _put(ws, r, R0 + 3, f_std("mse", mogu))
-        ws.cell(row=r, column=R0 + 4, value=f_count(moe))
-        ws.cell(row=r, column=R0 + 5, value=f_count(mogu))
-        mean_c, std_c = f"{CL(R0 + 2)}{r}", f"{CL(R0 + 3)}{r}"
-        _put(ws, r, R0 + 7, f_delta(mean_c, f"E{r}"), fmt=DELTA_FMT, fill=False)
-        _put(ws, r, R0 + 8, f_delta(std_c, f"G{r}"), fmt=DELTA_FMT, fill=False)
-        ws.cell(row=r, column=R0 + 9, value=(
-            f'=IF(OR({CL(R0 + 1)}{r}="",{std_c}="",{std_c}=0),"",'
-            f'{CL(R0 + 1)}{r}/{std_c})')).number_format = "0.00"
-        d = f"{CL(R0 + 7)}{r}"
-        ws.cell(row=r, column=R0 + 10, value=(
-            f'=IF({mean_c}="","not run",IF(E{r}="","no target",'
-            f'IF(ABS({d}/E{r})<={TOL_MATCH},"match",'
-            f'IF(ABS({d}/E{r})<={TOL_CLOSE},"close","FAIL"))))')).font = STATUS_FONT
-        if audit is not None:
-            audit.append((f"MoGU_ETT!{CL(R0)}{r}", f"T4 {dset} MoE mean",
-                          resolve(runs, "mse", moe), ws[f"C{r}"].value))
-            audit.append((f"MoGU_ETT!{mean_c}", f"T4 {dset} MoGU mean",
-                          resolve(runs, "mse", mogu), ws[f"E{r}"].value))
-
-    _banner(ws, 51, R0, "MoGU's advantage is as much about variance as mean: its seed "
-                        "std should be 2-4x tighter than MoE's. The 'std ratio' column "
-                        "checks that claim for free.")
-
+    ws["A3"] = ("PUBLISHED REFERENCE ONLY — moe_unc_tsf has not been run, so the columns "
+                "reserved for our numbers have been removed rather than left blank. "
+                "Reproducing MoGU Table 1 (ETTh1 h=96, MoGU-3 ≈ 0.380) is the next "
+                "milestone for this sheet.")
+    ws["A3"].font = Font(name="Arial", size=9, bold=True, italic=True, color="FF8A2A2A")
+    print("  MoGU_ETT: reduced to a published reference (4 never-run columns removed)")
 
 # ==========================================================================
+
+def fill_domain_rollups(wb, runs):
+    """Fill the two domain-level sheets with our mixed-pool means.
+
+    Both sheets reserved 'your best' columns. We have mixed-pool runs (numeric +
+    text), so those get filled; the text-only and numeric-only pool columns were
+    removed by trim_empty_columns because those pools were never run.
+
+    'Your best' is replaced with explicit per-gate columns: 'best' is ambiguous
+    about whether it means the minimum or the chosen method, and an ambiguous
+    header is worse than an extra column.
+    """
+    OURS = [("ours G3\nmean", "G3_ATTN_direct"), ("ours G4\nmean", "G4_IV"),
+            ("ours G4c\nmean", "G4c_IV_calib")]
+
+    if "Pool_Ablation" in wb.sheetnames:
+        ws = wb["Pool_Ablation"]
+        base_col = 5                     # where 'M: G4 IV' survived the trim
+        for j, (label, _m) in enumerate(OURS):
+            c = ws.cell(row=5, column=base_col + j, value="MIXED pool\n" + label)
+            c.font, c.fill = REPRO_HDR_FONT, REPRO_HDR_FILL
+            c.alignment = Alignment(horizontal="center", wrap_text=True)
+            ws.column_dimensions[CL(base_col + j)].width = 14
+        n = 0
+        for r in range(6, ws.max_row + 1):
+            dom, hz = ws[f"A{r}"].value, ws[f"B{r}"].value
+            if not dom or not isinstance(hz, (int, float)):
+                continue
+            for j, (_l, method) in enumerate(OURS):
+                filt = [("domain_sheet", str(dom).strip()), ("pred_len", int(hz)),
+                        ("method", method)]
+                _put(ws, r, base_col + j, f_mean("mse", filt))
+            n += 1
+        ws.cell(row=ws.max_row + 2, column=1, value=(
+            "Our columns are the mean over every expert pair we ran in that domain and "
+            "horizon — PatchTST x {GPT2, BERT, LLAMA2} and iTransformer x GPT2 — across "
+            "3 seeds. Averaging WITHIN a domain and horizon is safe; averaging across "
+            "domains is not.")).font = Font(name="Arial", size=9, italic=True,
+                                            color="FF555555")
+        print(f"  Pool_Ablation: filled {n} rows x {len(OURS)} mixed-pool columns")
+
+    if "Domain_Summary" in wb.sheetnames:
+        ws = wb["Domain_Summary"]
+        base_col = 8                     # where 'Your best (mixed)' survived
+        for j, (label, _m) in enumerate(OURS):
+            c = ws.cell(row=4, column=base_col + j, value="MIXED pool\n" + label)
+            c.font, c.fill = REPRO_HDR_FONT, REPRO_HDR_FILL
+            c.alignment = Alignment(horizontal="center", wrap_text=True)
+            ws.column_dimensions[CL(base_col + j)].width = 14
+        n = 0
+        for r in range(5, ws.max_row + 1):
+            dom = ws[f"A{r}"].value
+            if not dom or not isinstance(ws[f"B{r}"].value, (int, float)):
+                continue
+            for j, (_l, method) in enumerate(OURS):
+                filt = [("domain_sheet", str(dom).strip()), ("method", method)]
+                _put(ws, r, base_col + j, f_mean("mse", filt))
+            n += 1
+        print(f"  Domain_Summary: filled {n} rows x {len(OURS)} mixed-pool columns")
+
+
+
+def build_readme(wb, runs):
+    """Rewrite README as a real index: what each sheet is, and what was run."""
+    import collections
+    if "README" in wb.sheetnames:
+        del wb["README"]
+    ws = wb.create_sheet("README", 0)
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 104
+
+    by_method = collections.Counter(r["method"] for r in runs if r.get("method"))
+    by_dom = collections.Counter(r["domain_sheet"] for r in runs if r.get("domain_sheet"))
+    pairs = collections.Counter(f'{r["model"]} x {r["tsf_t"]}' for r in runs
+                                if r.get("model") and r.get("tsf_t"))
+    seeds = sorted({str(r["seed"]) for r in runs if r.get("seed")})
+
+    S = {
+        "H":  (Font(name="Arial", size=11, bold=True, color="FFFFFFFF"),
+               PatternFill("solid", fgColor="FF215E6B")),
+        "K":  (Font(name="Arial", size=10, bold=True), None),
+        "W":  (Font(name="Arial", size=10, bold=True, color="FF8A2A2A"), None),
+        "T":  (Font(name="Arial", size=10), None),
+    }
+
+    rows = [
+        ("TITLE", "MM-MoGU — inverse-variance gating for multimodal time-series forecasting", ""),
+        ("T", "", f"Built {__import__('datetime').date.today().isoformat()} from "
+                  f"{len(runs)} runs. Every figure in this workbook is either a PUBLISHED "
+                  f"reference (locked) or a live formula over the Raw_Runs sheet."),
+        ("B", "", ""),
+
+        ("H", "START HERE", ""),
+        ("K", "Legend", "Every symbol defined: what G1/G3/G4/G4c/G4n mean, what TSF-N and "
+                        "TSF-T are, the colour key, and the caveats to state alongside any "
+                        "number. Read this first."),
+        ("K", "Results_Summary", "EVERY figure as plain static numbers — published beside "
+                                 "ours, per domain / expert pair / horizon. Renders in any "
+                                 "viewer. Start here if you only look at one sheet."),
+        ("B", "", ""),
+
+        ("H", "THE RESULT", ""),
+        ("K", "Pairwise_Baselines", "The main table. Published G1 and G3 (columns F-G, "
+                                    "locked) beside our G1, G3, G4, G4c and G4n (H-L), the "
+                                    "deltas, and the harness check. Live formulas. Rows "
+                                    "below the published block are pairs we ran that have "
+                                    "no published counterpart."),
+        ("K", "Calibration", "The mechanism. c_e = E_val[(y-yhat)^2]/E_val[sigma^2] per "
+                             "expert, for all 36 cells, with the text/numeric ratio. The "
+                             "ratio exceeds 1 everywhere, which is why raw 1/sigma^2 "
+                             "over-weights the text expert."),
+        ("K", "Prior_Bakeoff", "The July frozen-expert study, and which of its findings "
+                               "replicated under the joint training recipe."),
+        ("B", "", ""),
+
+        ("H", "PUBLISHED REFERENCE ONLY — nothing of ours in these", ""),
+        ("K", "Gating_Methods", "Definition of every gate G1-G7, including the three "
+                                "proposed ones we have not run."),
+        ("K", "Experiment_Matrix", "The originally planned pool x gate grid."),
+        ("K", "MoGU_ETT", "MoGU's own ETT benchmarks, verified against the paper PDF. "
+                          "moe_unc_tsf has not been run, so the columns reserved for our "
+                          "numbers were removed rather than left blank."),
+        ("K", "Unimodal_Reference", "Single-expert floors from the GMM-TS supplementary."),
+        ("K", "Critical_Cases", "Configurations where multimodal loses. Note its Time-MMD "
+                                "block is LOW confidence — automated PDF extraction, "
+                                "unverified."),
+        ("K", "Published_Ablations", "What the papers already prove about gating."),
+        ("K", "Sources", "Every published figure traced to its paper and table, with a "
+                         "confidence rating."),
+        ("B", "", ""),
+
+        ("H", "DOMAIN ROLL-UPS", ""),
+        ("K", "Pool_Ablation", "Domain x horizon. Text-only and numeric-only pool columns "
+                               "were REMOVED — those pools were never run. The mixed-pool "
+                               "columns carry our means."),
+        ("K", "Domain_Summary", "Nine-domain roll-up. Same removal. Read its consistency "
+                                "warning: the published Table 16 averages do not equal the "
+                                "mean of the Pairwise rows."),
+        ("B", "", ""),
+
+        ("H", "THE DATA", ""),
+        ("K", "Raw_Runs", f"One row per run, {len(runs)} rows, 33 columns. Every row "
+                          "carries its git_sha, so any figure traces to the code that "
+                          "produced it. All summary formulas read from here."),
+        ("B", "", ""),
+
+        ("H", "WHAT WAS RUN", ""),
+        ("K", "Total", f"{len(runs)} runs, seeds {', '.join(seeds)}, horizons 6 / 8 / 10 / 12 months."),
+        ("K", "By domain", "  ".join(f"{k}: {v}" for k, v in sorted(by_dom.items()))),
+        ("K", "By expert pair", "  ".join(f"{k}: {v}" for k, v in sorted(pairs.items()))),
+        ("K", "By gate", "  ".join(f"{k}: {v}" for k, v in sorted(by_method.items()))),
+        ("B", "", ""),
+
+        ("H", "THE FIVE GATES, IN ONE LINE EACH", ""),
+        ("K", "G1 FIXED", "Time-MMD. One hand-set constant blends text and numeric "
+                          "identically for every input. No routing."),
+        ("K", "G3 ATTN", "GMM-TS. A LEARNED network predicts the weights. Trainable gate."),
+        ("K", "G4 IV", "Ours. w proportional to 1/sigma^2 from each expert's own predicted "
+                       "variance. ZERO trained gating parameters."),
+        ("K", "G4c IV-calib", "Ours. Same, after multiplying each expert's variance by "
+                              "c_e fitted on validation. Temperature scaling in the "
+                              "variance domain."),
+        ("K", "G4n IV-per-mod", "Ours. Log-variance z-scored within each modality. NOT the "
+                                "G5 SNIV defined in Gating_Methods — a different operation, "
+                                "and one that is provably invariant to the rescaling "
+                                "calibration performs."),
+        ("B", "", ""),
+
+        ("H", "HOW TO READ A NUMBER", ""),
+        ("T", "", "MSE throughout, lower is better. Deltas are ours minus published, so "
+                  "NEGATIVE means we scored better. Every cell is the mean over 3 seeds."),
+        ("W", "Noise floor", "Test sets are small — 64 windows on Economy, 160 on Social "
+                             "Good. Any gap smaller than the seed spread is noise and is "
+                             "reported as such, not as a win."),
+        ("W", "Never average across domains", "Economy is about 0.02, Social Good about "
+                                              "1.0, Security about 112. Compare within a "
+                                              "domain, per horizon, per expert pair."),
+        ("W", "G4 vs G3 is not gate-only", "G4 needs prob_expert=1, which adds uncertainty "
+                                           "heads AND switches the loss from MSE to "
+                                           "per-expert Gaussian NLL. Intrinsic to the "
+                                           "method, but state it. G4c vs G4 IS gate-only."),
+        ("W", "Empty means not run", "Every column reserved for an experiment that was "
+                                     "never run has been removed. A blank cell now means "
+                                     "the run is missing, not that the column was "
+                                     "aspirational."),
+    ]
+
+    r = 1
+    for kind, key, text in rows:
+        if kind == "B":
+            r += 1
+            continue
+        if kind == "TITLE":
+            c = ws.cell(row=r, column=1, value=key)
+            c.font = Font(name="Arial", size=13, bold=True, color="FF215E6B")
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+        elif kind == "H":
+            for j in (1, 2):
+                c = ws.cell(row=r, column=j, value=key if j == 1 else "")
+                c.font, c.fill = S["H"]
+        else:
+            if key:
+                ws.cell(row=r, column=1, value=key).font = S[kind][0]
+            c = ws.cell(row=r, column=2, value=text)
+            c.font = Font(name="Arial", size=10,
+                          color="FF8A2A2A" if kind == "W" else "FF000000")
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.row_dimensions[r].height = max(14, 12.5 * (len(text) // 98 + 1))
+        r += 1
+    print(f"  README: {r-1} rows")
+
+
+
+def repoint_pairwise_refs(wb, first_row, last_row):
+    """Re-aim formulas that point INTO Pairwise_Baselines after it is rebuilt.
+
+    Pool_Ablation and Critical_Cases carry ranges hard-coded to the v2 layout,
+    where the published block ran from row 6 to row 546. The rebuild puts the
+    header on row 6 and the published block on 7..547, and appends unmatched
+    rows below it. Left alone, every one of those ranges would silently include
+    the header row, miss the last published row, and -- if anyone widened them --
+    start averaging our unmatched rows into a "published reference mean".
+
+    This is exactly the kind of breakage a rebuild causes and a row count never
+    reveals, so it is repaired explicitly rather than left to chance.
+    """
+    import re
+    pat = re.compile(r"(Pairwise_Baselines!\$([A-Z]+)\$)6(:\$([A-Z]+)\$)546")
+    fixed = collections.Counter()
+    for ws in wb.worksheets:
+        if ws.title == "Pairwise_Baselines":
+            continue
+        for row in ws.iter_rows():
+            for c in row:
+                v = c.value
+                if isinstance(v, str) and v.startswith("=") and "Pairwise_Baselines!" in v:
+                    new = pat.sub(lambda m: f"{m.group(1)}{first_row}{m.group(3)}{last_row}", v)
+                    if new != v:
+                        c.value = new
+                        fixed[ws.title] += 1
+    for sheet, n in sorted(fixed.items()):
+        print(f"  {sheet}: re-aimed {n} reference(s) to rows {first_row}-{last_row}")
+    if not fixed:
+        print("  no cross-sheet references needed re-aiming")
+    return sum(fixed.values())
+
+
 def report_audit(audit, n_runs):
     print()
     print("=" * 74)
@@ -1195,6 +1370,9 @@ def main():
                 published[(str(dom).strip(), str(n).strip(), str(t).strip(), int(hz))] = (
                     pw[f"F{rr}"].value, pw[f"G{rr}"].value)
 
+    print("\nwriting README")
+    build_readme(wb, runs)
+
     print("\nwriting Results_Summary (static)")
     build_summary(wb, runs, published)
 
@@ -1209,9 +1387,19 @@ def main():
     build_calibration(wb)
 
     print("\nwiring Pairwise_Baselines (the deliverable)")
-    build_pairwise(wb, runs, audit)
+    pw_span = build_pairwise(wb, runs, audit)
+
+    print("\nre-aiming cross-sheet references at the rebuilt Pairwise block")
+    if pw_span:
+        repoint_pairwise_refs(wb, pw_span[0], pw_span[1])
     print("\nwiring MoGU_ETT")
     build_mogu_ett(wb, runs, audit)
+
+    print("\ntrimming never-run columns")
+    trim_empty_columns(wb)
+
+    print("\nfilling domain roll-ups with our mixed-pool means")
+    fill_domain_rollups(wb, runs)
 
     report_audit(audit, len(runs))
     report_claim(runs)
